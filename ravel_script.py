@@ -1,60 +1,63 @@
-from ravel import *
-from ravel.utils import *
-import socket
+from ravel.app import App
+from ravel.util import resolve
+import random
 
 class LoadBalancer(App):
-    def __init__(self):
-        super().__init__()
-        self.servers = [
-            '10.0.0.2', # server1
-            '10.0.0.3', # server2
-            '10.0.0.4', # server3
-        ]
-        self.current_server = 0
+    def init(self):
+        self.listen("switchEnter", self.switch_enter)
+        self.listen("packetIn", self.packet_in)
+        self.hosts = []
+        self.switches = []
 
-    def start(self):
-        lb_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        lb_socket.bind(('10.0.0.1', 9000))
-        lb_socket.listen()
-        while True:
-            conn, addr = lb_socket.accept()
-            server = self.servers[self.current_server]
-            self.current_server = (self.current_server + 1) % len(self.servers)
-            server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            server_socket.connect((server, 8000))
-            data = conn.recv(1024)
-            server_socket.sendall(data)
-            response = server_socket.recv(1024)
-            conn.sendall(response)
-            conn.close()
-            server_socket.close()
+    def switch_enter(self, event):
+        self.switches.append(event.switch)
 
-class LoadBalancerTopology(Topo):
-    def build(self):
-        lb = self.addHost('lb')
-        server1 = self.addHost('server1')
-        server2 = self.addHost('server2')
-        server3 = self.addHost('server3')
-        switch1 = self.addSwitch('switch1')
-        switch2 = self.addSwitch('switch2')
-        self.addLink(lb, switch1)
-        self.addLink(server1, switch2)
-        self.addLink(server2, switch2)
-        self.addLink(server3, switch2)
-        self.addLink(switch1, switch2)
+    def packet_in(self, event):
+        packet = event.packet
+        if packet.isArp():
+            self.handle_arp(event)
+        elif packet.isIp():
+            self.handle_ip(event)
 
-if __name__ == '__main__':
-    topo = LoadBalancerTopology()
-    policy = BasicPolicy()
-    policy.allow('all')
-    network = ControlNetwork(controller=LocalController)
-    network.start()
-    network.addTopology(topo, policy)
-    network.startApps([
-        ('lb', LoadBalancer),
-        ('server1', BasicWebServer),
-        ('server2', BasicWebServer),
-        ('server3', BasicWebServer),
-    ])
-    network.CLI()
-    network.stop()
+    def handle_arp(self, event):
+        packet = event.packet
+        for switch in self.switches:
+            for port in switch.ports.values():
+                if port.mac == packet.dst_mac:
+                    event.output = port
+                    return
+
+    def handle_ip(self, event):
+        packet = event.packet
+        if packet.dst_ip in self.hosts:
+            self.send_packet_to_host(event)
+        else:
+            self.load_balance(event)
+
+    def send_packet_to_host(self, event):
+        packet = event.packet
+        for switch in self.switches:
+            for port in switch.ports.values():
+                if port.mac == packet.dst_mac:
+                    event.output = port
+                    return
+
+    def load_balance(self, event):
+        packet = event.packet
+        hosts = [h for h in self.hosts if h != packet.src_ip]
+        if len(hosts) > 0:
+            ip = random.choice(hosts)
+            self.send_packet_to_ip(ip, event)
+        else:
+            event.drop()
+
+    def send_packet_to_ip(self, ip, event):
+        packet = event.packet
+        for switch in self.switches:
+            for port in switch.ports.values():
+                if port.mac == resolve(ip):
+                    event.output = port
+                    return
+
+    def add_host(self, host):
+        self.hosts.append(host)
